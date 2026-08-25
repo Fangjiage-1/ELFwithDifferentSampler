@@ -4,12 +4,7 @@ import torch
 import torch.nn as nn
 
 from configs.config import Config, SamplingConfig
-from utils.sampling_utils import (
-    restore_cond,
-    _ode_step,
-    _heun_step,
-    _dpm_solver_2_like_step,
-)
+from utils.sampling_utils import restore_cond, _ode_step, _sde_step
 
 
 # ============================================
@@ -70,7 +65,7 @@ def _generate_samples_single_batch(
     cfg_scale: float,
     self_cond_cfg_scale: float,
 ) -> torch.Tensor:
-    """Generate samples with Euler, Heun, or DPM-Solver-2-like updates."""
+    """Generate samples for a single batch (PyTorch Euler / SDE rollout)."""
     method = sampling_config.sampling_method
     batch_size, max_length, d_model = z.shape
     if cond_seq is None:
@@ -87,19 +82,20 @@ def _generate_samples_single_batch(
     x_pred = restore_cond(torch.zeros_like(z), cond_seq, cond_seq_mask)
 
     n = t_steps.shape[0]
+    sde_gamma = getattr(sampling_config, "sde_gamma", 0.0)
+
     use_bf16 = bool(getattr(config, "use_bf16", True)) and z.is_cuda
     with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_bf16):
         for i in range(n - 2):
             t = t_steps[i].item()
             t_next = t_steps[i + 1].item()
-            if method == "ode":
-                z, x_pred = _ode_step(z=z, t=t, t_next=t_next, x_pred_prev=x_pred, **step_kwargs)
-            elif method == "heun":
-                z, x_pred = _heun_step(z=z, t=t, t_next=t_next, x_pred_prev=x_pred, **step_kwargs)
-            elif method == "dpm_solver_2_like":
-                z, x_pred = _dpm_solver_2_like_step(
-                    z=z, t=t, t_next=t_next, x_pred_prev=x_pred, **step_kwargs,
+            if method == "sde":
+                z, x_pred = _sde_step(
+                    z=z, t=t, t_next=t_next, x_pred_prev=x_pred,
+                    gamma=sde_gamma, generator=generator, **step_kwargs,
                 )
+            elif method == "ode":
+                z, x_pred = _ode_step(z=z, t=t, t_next=t_next, x_pred_prev=x_pred, **step_kwargs)
             else:
                 raise ValueError(f"Invalid sampling method: {method}")
 
@@ -138,4 +134,5 @@ def _build_run_name(sampling_method, num_sampling_steps, cfg_scale, self_cond_cf
                     time_schedule, sde_gamma, suffix):
     ts_str = f"-ts_{time_schedule}"
     sccfg_str = f"-sccfg{self_cond_cfg_scale}" if self_cond_cfg_scale != 1.0 else ""
-    return f"{sampling_method}-steps{num_sampling_steps}-cfg{cfg_scale}{sccfg_str}{ts_str}-{suffix}"
+    sde_str = f"-gamma{sde_gamma}" if sampling_method == "sde" else ""
+    return f"{sampling_method}-steps{num_sampling_steps}-cfg{cfg_scale}{sccfg_str}{ts_str}{sde_str}-{suffix}"

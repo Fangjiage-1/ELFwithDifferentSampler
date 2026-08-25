@@ -130,17 +130,37 @@ def net_out_to_v_x(net_out, z, t, t_eps=5e-2):
 def _forward_sample_self_cond(
     model, z, t_batch, x_pred_prev, config,
     self_cond_cfg_scale, cond_seq, cond_seq_mask,
+    sc_noise_scale=0.0,
 ):
-    """Forward pass with self-conditioning."""
+    """Forward pass with self-conditioning.
+
+    Args:
+        sc_noise_scale: if > 0, add isotropic Gaussian noise to x_pred_prev
+            before concatenating as self-conditioning input.  Noise decays
+            as (1-t)² so perturbation vanishes at t→1.  Inspired by LeWM's
+            SIGReg — the noise prevents the self-conditioning from collapsing
+            into a single mode.
+    """
     t_eps = config.t_eps
     self_cond_prob = config.self_cond_prob
 
     def _restore(v, x):
         return restore_vx(v, x, cond_seq=cond_seq, cond_seq_mask=cond_seq_mask)
 
+    def _perturb_x_pred(xp, t_b):
+        """Add isotropic noise that decays as t→1."""
+        scn = getattr(config, '_sc_noise_scale', 0.0)
+        if scn <= 0 or xp is None:
+            return xp
+        # Decay factor: (1-t)² — strong near t≈0, gone at t=1
+        decay = (1.0 - t_b.reshape(-1, 1, 1)) ** 2
+        noise = scn * decay * torch.randn_like(xp)
+        return restore_cond(xp + noise, cond_seq, cond_seq_mask)
+
     if config.num_self_cond_cfg_tokens > 0:
         if x_pred_prev is None:
             x_pred_prev = restore_cond(torch.zeros_like(z), cond_seq, cond_seq_mask)
+        x_pred_prev = _perturb_x_pred(x_pred_prev, t_batch)
         z_input_cond = torch.cat([z, x_pred_prev], dim=-1)
         self_cond_scale_batch = torch.full((z.shape[0],), float(self_cond_cfg_scale),
                                            dtype=z.dtype, device=z.device)
@@ -166,6 +186,7 @@ def _forward_sample_self_cond(
         if self_cond_cfg_scale == 0.0 or x_pred_prev is None:
             return v_uncond, x_uncond
 
+    x_pred_prev = _perturb_x_pred(x_pred_prev, t_batch)
     z_input_cond = torch.cat([z, x_pred_prev], dim=-1)
     net_out_cond = model(z_input_cond, t_batch, deterministic=True)
     v_cond, x_cond = net_out_to_v_x(net_out_cond, z, t_batch, t_eps)
@@ -181,6 +202,7 @@ def _forward_sample_self_cond(
 def _forward_sample(
     model, z, t_batch, x_pred_prev, config,
     cfg_scale, self_cond_cfg_scale, cond_seq, cond_seq_mask,
+    sc_noise_scale=0.0,
 ):
     """Forward pass with optional self-conditioning and CFG."""
     v_cond, x_cond = _forward_sample_self_cond(
@@ -223,29 +245,81 @@ def _ode_step(
     return z + (t_next - t) * v_pred, x_pred
 
 
-def _sde_step(
+def _heun_step(
     model, z, t, t_next, x_pred_prev,
     config, cfg_scale, self_cond_cfg_scale,
-    cond_seq, cond_seq_mask, gamma, generator,
+    cond_seq, cond_seq_mask,
 ):
-    """Per-step SDE-style sampler with hybrid (t-and-step) noise scaling.
+    """Single Heun (2nd-order Runge-Kutta / improved Euler) step for sampling.
 
-    t_back = t * (1 - gamma * h), where h = t_next - t. alpha = 1 - gamma*h is the
-    signal-preservation fraction, constant in t. gamma=0 degenerates to a plain ODE step.
-    Uniform-N-step equivalence with old multiplicative gamma_old: gamma_hybrid = gamma_old * N.
+    Heun's method for dz/dt = v(z, t):
+      1. predictor: v1 = v(z, t),        z_pred = z + h * v1
+      2. corrector: v2 = v(z_pred, t+h), z_next = z + h/2 * (v1 + v2)
+
+    Per-step error is O(h^3) vs Euler's O(h^2), so fewer steps can achieve
+    the same global accuracy. Each step costs 2 NFEs (network evaluations).
     """
     h = float(t_next - t)
-    alpha = max(0.0, min(1.0, 1.0 - gamma * h))
-    t_back = alpha * float(t)
-    if z.is_cuda:
-        eps = torch.randn(z.shape, dtype=z.dtype, device=z.device) * config.denoiser_noise_scale
-    else:
-        eps = torch.randn(z.shape, generator=generator, dtype=z.dtype) * config.denoiser_noise_scale
-    z_back = restore_cond(alpha * z + (1.0 - alpha) * eps, cond_seq, cond_seq_mask)
-    t_batch = torch.full((z.shape[0],), t_back, dtype=z.dtype, device=z.device)
-    v_pred, x_pred = _forward_sample(
-        model=model, z=z_back, t_batch=t_batch, x_pred_prev=x_pred_prev,
+
+    # Stage 1: evaluate at current position (same as one Euler step).
+    t_batch = torch.full((z.shape[0],), float(t), dtype=z.dtype, device=z.device)
+    v1, x_pred_stage1 = _forward_sample(
+        model=model, z=z, t_batch=t_batch, x_pred_prev=x_pred_prev,
         config=config, cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
         cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
     )
-    return z_back + (t_next - t_back) * v_pred, x_pred
+    z_pred = restore_cond(z + h * v1, cond_seq, cond_seq_mask)
+    x_pred_stage1 = restore_cond(x_pred_stage1, cond_seq, cond_seq_mask)
+
+    # Stage 2: evaluate at the predicted next position.
+    t_next_batch = torch.full((z.shape[0],), float(t_next), dtype=z.dtype, device=z.device)
+    v2, x_pred = _forward_sample(
+        model=model, z=z_pred, t_batch=t_next_batch, x_pred_prev=x_pred_stage1,
+        config=config, cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
+        cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
+    )
+
+    # Trapezoidal corrector: average the two velocity estimates.
+    return restore_cond(z + h / 2.0 * (v1 + v2), cond_seq, cond_seq_mask), x_pred
+
+
+def _dpm_solver_2_like_step(
+    model, z, t, t_next, x_pred_prev,
+    config, cfg_scale, self_cond_cfg_scale,
+    cond_seq, cond_seq_mask,
+):
+    """DPM-Solver-2-like sampler adapted to the ELF flow-matching ODE.
+
+    This is a second-order exponential midpoint method rather than the
+    original image-diffusion DPM-Solver-2 implementation.
+
+      1. x0_1 = model(z, t)                                          (1 NFE)
+      2. z_mid  = x0_1 + (z - x0_1) * (1-t_mid)/(1-t)    (exp half-step)
+      3. x0_2 = model(z_mid, t_mid)                                  (2 NFE)
+      4. z_next = x0_2 + (z - x0_2) * (1-t_next)/(1-t)   (exp full-step)
+
+    Cost: 2 NFEs per step.
+    """
+    t_mid = (float(t) + float(t_next)) / 2.0
+
+    # Stage 1: exponential half-step with x0 at current t.
+    t_batch = torch.full((z.shape[0],), float(t), dtype=z.dtype, device=z.device)
+    _, x0_1 = _forward_sample(
+        model=model, z=z, t_batch=t_batch, x_pred_prev=x_pred_prev,
+        config=config, cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
+        cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
+    )
+    ratio_mid = (1.0 - t_mid) / (1.0 - float(t))
+    z_mid = x0_1 + (z - x0_1) * ratio_mid
+    z_mid = restore_cond(z_mid, cond_seq, cond_seq_mask)
+
+    # Stage 2: exponential full-step with x0 at midpoint.
+    t_mid_batch = torch.full((z.shape[0],), t_mid, dtype=z.dtype, device=z.device)
+    _, x0 = _forward_sample(
+        model=model, z=z_mid, t_batch=t_mid_batch, x_pred_prev=x0_1,
+        config=config, cfg_scale=cfg_scale, self_cond_cfg_scale=self_cond_cfg_scale,
+        cond_seq=cond_seq, cond_seq_mask=cond_seq_mask,
+    )
+    ratio = (1.0 - float(t_next)) / (1.0 - float(t))
+    z_next = x0 + (z - x0) * ratio
+    return restore_cond(z_next, cond_seq, cond_seq_mask), x0

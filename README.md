@@ -1,4 +1,4 @@
-# ELF: Embedded Language Flows
+# ELF: Embedded Language Flows  
 
 [![arXiv](https://img.shields.io/badge/arXiv-2605.10938-b31b1b.svg)](https://arxiv.org/abs/2605.10938)&nbsp;
 [![Hugging Face](https://img.shields.io/badge/Hugging%20Face-ELF-yellow.svg)](https://huggingface.co/embedded-language-flows)&nbsp;
